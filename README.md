@@ -1,18 +1,14 @@
-# PoC: GitHub Actions Workflow Command Injection
+# PoC: Workflow Command Injection Breaks Secret Masking
 
-Demonstrates workflow command injection via unsanitized `body` field logged
-to stdout in `post-buffered-inline-comments.ts` (anthropics/claude-code-action).
+Proves that unsanitized `console.log()` output in `post-buffered-inline-comments.ts`
+(anthropics/claude-code-action) enables workflow command injection that disables
+`::add-mask::`, causing dynamic secrets to leak in plaintext in GitHub Actions logs.
 
-## Vulnerability
+## Results
 
-When buffered inline comments are classified as "test/probe", their `body`
-field is logged via `console.log` without neutralizing embedded newlines or
-`::command::` sequences. The GitHub Actions runner parses stdout line-by-line
-for workflow commands, so a body containing `\n::warning::payload` produces
-an injected annotation.
-
-## Expected Results
-
-- **Step 2**: Injected `::warning::` and `::error::` appear as real CI annotations
-- **Step 3**: If `::stop-commands::` was processed, subsequent `::warning::` is suppressed
-- **Step 4**: Control step shows normal annotations work independently
+| Step | Expected | Actual |
+|------|----------|--------|
+| Control | `Control output: ***` | `Control output: ***` (masked) |
+| Exploit B | Token masked | `LEAKED TOKEN: ghs_R3alInSt4llT0k3nV4lu3Here99` (plaintext) |
+| Exploit A | No attacker annotations | `X SECURITY BUG: authentication bypass detected` at `src/auth.ts#5` |
+| Exploit C | URL visible | `Exfiltration URL: ***` (attacker hid evidence) |
